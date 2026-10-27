@@ -1,0 +1,1399 @@
+using System;
+using System.Collections;
+using System.Globalization;
+using System.Reflection;
+using System.Text;
+using BepInEx;
+using BepInEx.Configuration;
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+
+namespace OutwardSurvival
+{
+    [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
+    public class OutwardSurvivalPlugin : BaseUnityPlugin
+    {
+        public const string PluginGuid = "valheim.outwardsurvivalsystem";
+        public const string PluginName = "Outward Survival System";
+        public const string PluginVersion = "0.11.0";
+
+        internal static ManualLogSource Log;
+        internal static ConfigEntry<float> BaseHealth;
+        internal static ConfigEntry<float> BaseStamina;
+        internal static ConfigEntry<float> BurnPercent;
+        internal static ConfigEntry<float> MinMaxStamina;
+        internal static ConfigEntry<bool> ResetOnDeath;
+        internal static ConfigEntry<bool> NoBurnDuringCorpseRun;
+        internal static ConfigEntry<bool> PoisonBoostsBurn;
+        internal static ConfigEntry<float> PoisonBurnMultiplier;
+        internal static ConfigEntry<float> HealthBurnPercent;
+        internal static ConfigEntry<float> MinMaxHealth;
+        internal static ConfigEntry<bool> ResetHealthOnDeath;
+        internal static ConfigEntry<float> SleepHealthRestorePercent;
+        internal static ConfigEntry<float> PotionHealthRestorePercent;
+        internal static ConfigEntry<bool> HungerPenalties;
+        internal static ConfigEntry<float> HungryBurnMultiplier;
+        internal static ConfigEntry<float> HungryDamageReduction;
+        internal static ConfigEntry<float> HungerHealthBurnPerSecond;
+        internal static ConfigEntry<float> RestorePerSecond;
+        internal static ConfigEntry<float> FireBonusPerSecond;
+        internal static ConfigEntry<bool> ScaleWithComfort;
+        internal static ConfigEntry<bool> ResetOnRested;
+        internal static ConfigEntry<bool> BlockInCombat;
+        internal static ConfigEntry<bool> BlockWhenWet;
+        internal static ConfigEntry<bool> BlockWhenCold;
+        internal static ConfigEntry<bool> BlockWhenFreezing;
+        internal static ConfigEntry<bool> BlockWhenEncumbered;
+        internal static ConfigEntry<float> CombatCooldown;
+        internal static ConfigEntry<bool> SleepAnytime;
+        internal static ConfigEntry<float> BurnedBarBrightness;
+        internal static ConfigEntry<float> BarOpacity;
+        internal static ConfigEntry<float> GradientStrength;
+        internal static ConfigEntry<float> FadeSpeed;
+        internal static ConfigEntry<float> HideDelay;
+        internal static ConfigEntry<float> BarHeightAdjust;
+        internal static ConfigEntry<float> BarOffsetX;
+        internal static ConfigEntry<float> BarOffsetY;
+        internal static ConfigEntry<float> BarWidthAdjust;
+        internal static ConfigEntry<Color> HealthBarColor;
+        internal static ConfigEntry<float> HealthBarOpacity;
+        internal static ConfigEntry<float> HealthBarGradientStrength;
+        internal static ConfigEntry<float> HealthBarHeightAdjust;
+        internal static ConfigEntry<float> HealthBarOffsetX;
+        internal static ConfigEntry<float> HealthBarOffsetY;
+        internal static ConfigEntry<float> HealthBarWidthAdjust;
+        internal static ConfigEntry<bool> DebugLogStamina;
+        internal static ConfigEntry<bool> DebugLogHealth;
+        internal static ConfigEntry<float> DebugBurned;
+        internal static ConfigEntry<float> DebugApplyAmount;
+        internal static ConfigEntry<KeyboardShortcut> DebugApplyKey;
+        internal static ConfigEntry<bool> DebugApplyNow;
+        internal static ConfigEntry<float> DebugBurnedHealth;
+        internal static ConfigEntry<float> DebugHealthApplyAmount;
+        internal static ConfigEntry<KeyboardShortcut> DebugHealthApplyKey;
+
+        private Harmony _harmony;
+
+        private void Awake()
+        {
+            Log = Logger;
+
+            BaseHealth = Config.Bind("Stats", "BaseHealth", 100f,
+                "Player base health before food bonuses.");
+            BaseStamina = Config.Bind("Stats", "BaseStamina", 100f,
+                "Player base stamina before food bonuses.");
+
+            BurnPercent = Config.Bind("Burned Stamina", "BurnPercent", 3f,
+                "Percent of every point of stamina spent that is burned off max stamina.");
+            MinMaxStamina = Config.Bind("Burned Stamina", "MinMaxStamina", 20f,
+                "Max stamina can never be burned below this value.");
+            ResetOnDeath = Config.Bind("Burned Stamina", "ResetOnDeath", false,
+                "If true, dying clears all burned stamina. If false, it carries over the respawn.");
+            NoBurnDuringCorpseRun = Config.Bind("Burned Stamina", "NoBurnDuringCorpseRun", true,
+                "Stamina spent while the Corpse Run effect is active adds no burn.");
+            PoisonBoostsBurn = Config.Bind("Burned Stamina", "PoisonBoostsBurn", true,
+                "Multiply the burn rate while Poisoned.");
+            PoisonBurnMultiplier = Config.Bind("Burned Stamina", "PoisonBurnMultiplier", 3f,
+                new ConfigDescription("Burn rate multiplier while Poisoned.",
+                    new AcceptableValueRange<float>(1f, 10f)));
+
+            HealthBurnPercent = Config.Bind("Burned Health", "BurnPercent", 10f,
+                new ConfigDescription("Percent of damage taken that is burned off max health.",
+                    new AcceptableValueRange<float>(0f, 100f)));
+            MinMaxHealth = Config.Bind("Burned Health", "MinMaxHealth", 25f,
+                new ConfigDescription("Max health can never be burned below this value.",
+                    new AcceptableValueRange<float>(1f, 200f)));
+            ResetHealthOnDeath = Config.Bind("Burned Health", "ResetHealthOnDeath", false,
+                "If true, dying clears all burned health. If false, it carries over the respawn.");
+
+            SleepHealthRestorePercent = Config.Bind("Burned Health Recovery", "SleepRestorePercent", 100f,
+                new ConfigDescription("Percent of your current burned health restored when you wake up from sleeping.",
+                    new AcceptableValueRange<float>(0f, 100f)));
+            PotionHealthRestorePercent = Config.Bind("Burned Health Recovery", "PotionRestorePercent", 50f,
+                new ConfigDescription("Percent of a healing potion's healing that is also restored as burned health " +
+                                      "(50 = a potion that heals 50 also restores 25 burned health).",
+                    new AcceptableValueRange<float>(0f, 200f)));
+
+            HungerPenalties = Config.Bind("Hunger", "HungerPenalties", true,
+                "Master switch for the hunger penalties (hungry = no food in any of the three food slots).");
+            HungryBurnMultiplier = Config.Bind("Hunger", "HungryBurnMultiplier", 3f,
+                new ConfigDescription("Multiplier for the health burn from damage taken while hungry.",
+                    new AcceptableValueRange<float>(1f, 10f)));
+            HungryDamageReduction = Config.Bind("Hunger", "HungryDamageReduction", 25f,
+                new ConfigDescription("Percent less damage you deal to creatures and players while hungry.",
+                    new AcceptableValueRange<float>(0f, 100f)));
+            HungerHealthBurnPerSecond = Config.Bind("Hunger", "HungerHealthBurnPerSecond", 0.1f,
+                new ConfigDescription("Max health burned per second while hungry (stops at MinMaxHealth).",
+                    new AcceptableValueRange<float>(0f, 5f)));
+
+            RestorePerSecond = Config.Bind("Burned Stamina Recovery", "RestorePerSecond", 0.2f,
+                new ConfigDescription("Burned stamina restored per second while sitting.",
+                    new AcceptableValueRange<float>(0f, 20f)));
+            FireBonusPerSecond = Config.Bind("Burned Stamina Recovery", "FireBonusPerSecond", 0.5f,
+                new ConfigDescription("Extra burned stamina restored per second while sitting near a fire.",
+                    new AcceptableValueRange<float>(0f, 20f)));
+            ScaleWithComfort = Config.Bind("Burned Stamina Recovery", "ScaleWithComfort", false,
+                "Multiply the restore rate by your comfort level.");
+            ResetOnRested = Config.Bind("Burned Stamina Recovery", "ResetOnRested", false,
+                "If true, gaining or refreshing the Rested buff clears all burned stamina. " +
+                "If false, only waking up from sleep does.");
+            BlockInCombat = Config.Bind("Burned Stamina Recovery", "BlockInCombat", true,
+                "No burned stamina recovery while in combat.");
+            BlockWhenWet = Config.Bind("Burned Stamina Recovery", "BlockWhenWet", true,
+                "No burned stamina recovery while Wet.");
+            BlockWhenCold = Config.Bind("Burned Stamina Recovery", "BlockWhenCold", true,
+                "No burned stamina recovery while Cold.");
+            BlockWhenFreezing = Config.Bind("Burned Stamina Recovery", "BlockWhenFreezing", true,
+                "No burned stamina recovery while Freezing.");
+            BlockWhenEncumbered = Config.Bind("Burned Stamina Recovery", "BlockWhenEncumbered", true,
+                "No burned stamina recovery while Encumbered.");
+            CombatCooldown = Config.Bind("Burned Stamina Recovery", "CombatCooldown", 10f,
+                new ConfigDescription("Seconds after dealing or taking damage that you still count as in combat.",
+                    new AcceptableValueRange<float>(0f, 60f)));
+            SleepAnytime = Config.Bind("Sleep", "SleepAnytime", true,
+                "Allow sleeping in a bed at any time of day.");
+
+            BurnedBarBrightness = Config.Bind("Burned Stamina Bar", "BurnedBarBrightness", 0.4f,
+                "Brightness of the burned section relative to the bar color (0.5 = 50% darker).");
+            BarOpacity = Config.Bind("Burned Stamina Bar", "Opacity", 0.5f,
+                new ConfigDescription("Opacity of the burned section.",
+                    new AcceptableValueRange<float>(0f, 1f)));
+            GradientStrength = Config.Bind("Burned Stamina Bar", "GradientStrength", 0.35f,
+                new ConfigDescription("How much darker the bottom of the burned section is than the top (0 = flat).",
+                    new AcceptableValueRange<float>(0f, 1f)));
+            FadeSpeed = Config.Bind("Burned Stamina Bar", "FadeSpeed", 4f,
+                new ConfigDescription("How fast the burned section fades in and out (fade time = 1 / speed seconds).",
+                    new AcceptableValueRange<float>(0.5f, 20f)));
+            HideDelay = Config.Bind("Burned Stamina Bar", "HideDelay", 0.3f,
+                new ConfigDescription("Seconds stamina must be full before the burned section starts fading out. " +
+                                      "The game's own stamina bar waits 1.0, so lower values fade this earlier.",
+                    new AcceptableValueRange<float>(0f, 2f)));
+            BarHeightAdjust = Config.Bind("Burned Stamina Bar", "HeightAdjust", -17f,
+                new ConfigDescription("Added to the burned section's height (negative = shorter).",
+                    new AcceptableValueRange<float>(-40f, 40f)));
+            BarOffsetY = Config.Bind("Burned Stamina Bar", "OffsetY", 0f,
+                new ConfigDescription("Moves the burned section up (positive) or down (negative).",
+                    new AcceptableValueRange<float>(-40f, 40f)));
+            BarOffsetX = Config.Bind("Burned Stamina Bar", "OffsetX", -8f,
+                new ConfigDescription("Moves the burned section right (positive) or left (negative).",
+                    new AcceptableValueRange<float>(-40f, 40f)));
+            BarWidthAdjust = Config.Bind("Burned Stamina Bar", "WidthAdjust", 4f,
+                new ConfigDescription("Added to the burned section's width (negative = narrower).",
+                    new AcceptableValueRange<float>(-40f, 40f)));
+
+            HealthBarColor = Config.Bind("Burned Health Bar", "Color", new Color(0.45f, 0.02f, 0.02f, 1f),
+                "Color of the burned section of the health bar (dark red by default).");
+            HealthBarOpacity = Config.Bind("Burned Health Bar", "Opacity", 1f,
+                new ConfigDescription("Opacity of the burned section.",
+                    new AcceptableValueRange<float>(0f, 1f)));
+            HealthBarGradientStrength = Config.Bind("Burned Health Bar", "GradientStrength", 0.35f,
+                new ConfigDescription("How much darker the bottom of the burned section is than the top (0 = flat).",
+                    new AcceptableValueRange<float>(0f, 1f)));
+            HealthBarHeightAdjust = Config.Bind("Burned Health Bar", "HeightAdjust", 0f,
+                new ConfigDescription("Added to the burned section's height (negative = shorter).",
+                    new AcceptableValueRange<float>(-40f, 40f)));
+            HealthBarOffsetY = Config.Bind("Burned Health Bar", "OffsetY", 0f,
+                new ConfigDescription("Moves the burned section up (positive) or down (negative).",
+                    new AcceptableValueRange<float>(-40f, 40f)));
+            HealthBarOffsetX = Config.Bind("Burned Health Bar", "OffsetX", 0f,
+                new ConfigDescription("Moves the burned section right (positive) or left (negative).",
+                    new AcceptableValueRange<float>(-40f, 40f)));
+            HealthBarWidthAdjust = Config.Bind("Burned Health Bar", "WidthAdjust", 0f,
+                new ConfigDescription("Added to the burned section's width (negative = narrower).",
+                    new AcceptableValueRange<float>(-40f, 40f)));
+
+            DebugLogStamina = Config.Bind("Debug", "DebugLogStamina", false,
+                "Log max stamina, burned stamina, active status effects and why recovery is blocked, about once per second.");
+            DebugLogHealth = Config.Bind("Debug", "DebugLogHealth", false,
+                "Log max health, burned health, hunger and each damage burn (also logs the health bar layout once at startup).");
+            DebugBurned = Config.Bind("Debug", "SetBurnedStamina", 0f,
+                new ConfigDescription("Test only: drag to set the burned stamina amount directly.",
+                    new AcceptableValueRange<float>(0f, 100f)));
+            DebugApplyAmount = Config.Bind("Debug", "ApplyAmount", 20f,
+                new ConfigDescription("Test only: how much burned stamina the hotkey / ApplyNow adds.",
+                    new AcceptableValueRange<float>(0f, 100f)));
+            DebugApplyKey = Config.Bind("Debug", "ApplyKey", KeyboardShortcut.Empty,
+                "Test only: press to add ApplyAmount burned stamina (unbound by default).");
+            DebugApplyNow = Config.Bind("Debug", "ApplyNow", false,
+                "Test only: switch on to add ApplyAmount burned stamina (switches itself back off).");
+            DebugBurnedHealth = Config.Bind("Debug", "SetBurnedHealth", 0f,
+                new ConfigDescription("Test only: drag to set the burned health amount directly.",
+                    new AcceptableValueRange<float>(0f, 100f)));
+            DebugHealthApplyAmount = Config.Bind("Debug", "HealthApplyAmount", 10f,
+                new ConfigDescription("Test only: how much burned health the health hotkey adds.",
+                    new AcceptableValueRange<float>(0f, 100f)));
+            DebugHealthApplyKey = Config.Bind("Debug", "HealthApplyKey", KeyboardShortcut.Empty,
+                "Test only: press to add HealthApplyAmount burned health (unbound by default).");
+
+            DebugBurned.SettingChanged += (sender, args) => StaminaBurn.Burned = DebugBurned.Value;
+            DebugBurnedHealth.SettingChanged += (sender, args) => HealthBurn.Burned = DebugBurnedHealth.Value;
+            DebugApplyNow.SettingChanged += (sender, args) =>
+            {
+                if (!DebugApplyNow.Value)
+                    return;
+
+                StaminaBurn.DebugApply(DebugApplyAmount.Value);
+                DebugApplyNow.Value = false;
+            };
+
+            _harmony = new Harmony(PluginGuid);
+            _harmony.PatchAll();
+
+            Log.LogInfo($"{PluginName} {PluginVersion} loaded.");
+        }
+
+        private void Update()
+        {
+            if (Player.m_localPlayer == null)
+                return;
+
+            if (DebugApplyKey.Value.IsDown())
+                StaminaBurn.DebugApply(DebugApplyAmount.Value);
+
+            if (DebugHealthApplyKey.Value.IsDown())
+                HealthBurn.DebugApply(DebugHealthApplyAmount.Value);
+        }
+
+        private void OnDestroy()
+        {
+            _harmony?.UnpatchSelf();
+        }
+    }
+
+    internal static class PatchHelper
+    {
+        // Used by Prepare() so a missing method skips one patch instead of breaking the plugin.
+        public static bool Found(MethodBase method, string label)
+        {
+            if (method != null)
+                return true;
+
+            OutwardSurvivalPlugin.Log?.LogWarning($"{label} not found; the related feature is unavailable.");
+            return false;
+        }
+    }
+
+    // A small vertical gradient sprite: white at the top, darker toward the bottom.
+    // It is multiplied by the Image color. Each bar keeps its own instance.
+    internal sealed class BarGradient
+    {
+        private const int Steps = 32;
+
+        private Texture2D _tex;
+        private Sprite _sprite;
+        private float _strength = -1f;
+
+        public Sprite Get(float strength)
+        {
+            if (_tex == null)
+            {
+                _tex = new Texture2D(1, Steps, TextureFormat.RGBA32, false);
+                _tex.wrapMode = TextureWrapMode.Clamp;
+                _tex.filterMode = FilterMode.Bilinear;
+                _tex.hideFlags = HideFlags.HideAndDontSave;
+
+                _sprite = Sprite.Create(_tex, new Rect(0f, 0f, 1f, Steps), new Vector2(0.5f, 0.5f), 100f);
+                _sprite.hideFlags = HideFlags.HideAndDontSave;
+
+                _strength = -1f;
+            }
+
+            if (!Mathf.Approximately(strength, _strength))
+            {
+                for (int y = 0; y < Steps; y++)
+                {
+                    float t = y / (float)(Steps - 1); // 0 = bottom, 1 = top
+                    float shade = Mathf.Lerp(1f - strength, 1f, t);
+                    _tex.SetPixel(0, y, new Color(shade, shade, shade, 1f));
+                }
+                _tex.Apply();
+                _strength = strength;
+            }
+
+            return _sprite;
+        }
+    }
+
+    internal static class HudUtil
+    {
+        // The direct child of root that contains the given bar (or null if it isn't under root).
+        private static Transform TopLevelChild(Transform root, Transform bar)
+        {
+            Transform t = bar;
+            while (t != null && t.parent != root)
+                t = t.parent;
+            return t;
+        }
+
+        // Put the overlay just before the bar in the draw order, so the real bars draw on top of it.
+        public static void PlaceBehind(Transform overlay, Transform root, Transform bar)
+        {
+            Transform t = TopLevelChild(root, bar);
+            if (t != null)
+                overlay.SetSiblingIndex(t.GetSiblingIndex());
+            else
+                overlay.SetAsFirstSibling();
+        }
+
+        // Put the overlay between two bars: above the one drawn first (the "slow" trail bar)
+        // and below the one drawn last (the "fast" bar). If both bars share one container,
+        // it can't go between them and ends up behind both.
+        public static void PlaceBetween(Transform overlay, Transform root, Transform barA, Transform barB)
+        {
+            Transform a = TopLevelChild(root, barA);
+            Transform b = TopLevelChild(root, barB);
+
+            Transform front;
+            if (a != null && b != null)
+                front = a.GetSiblingIndex() > b.GetSiblingIndex() ? a : b;
+            else
+                front = a != null ? a : b;
+
+            if (front != null)
+                overlay.SetSiblingIndex(front.GetSiblingIndex());
+            else
+                overlay.SetAsFirstSibling();
+        }
+    }
+
+    internal static class HealthBurn
+    {
+        public const string SaveKey = "OutwardSurvival.BurnedHealth";
+
+        // Live burned health, taken off max health.
+        public static float Burned;
+
+        // Burn actually subtracted from max health at the last food update (used by the HUD).
+        public static float Applied;
+
+        // Frame in which max health was just lowered by us; health clamps in that frame are not damage.
+        public static int IgnoreDecreaseFrame = -1;
+
+        private static float _lastHungerTick = -1f;
+        private static float _loadedAt = -999f;
+
+        // Found by name so a rename in the game's code can't break compilation.
+        private static readonly Func<Player, ICollection> GetFoods = BuildFoodsGetter();
+
+        private static Func<Player, ICollection> BuildFoodsGetter()
+        {
+            MethodInfo method = AccessTools.Method(typeof(Player), "GetFoods");
+            if (method != null && method.GetParameters().Length == 0 &&
+                typeof(ICollection).IsAssignableFrom(method.ReturnType))
+            {
+                try
+                {
+                    return (Func<Player, ICollection>)Delegate.CreateDelegate(
+                        typeof(Func<Player, ICollection>), method);
+                }
+                catch (ArgumentException)
+                {
+                }
+            }
+
+            FieldInfo field = AccessTools.Field(typeof(Player), "m_foods");
+            if (field != null && typeof(ICollection).IsAssignableFrom(field.FieldType))
+                return player => (ICollection)field.GetValue(player);
+
+            OutwardSurvivalPlugin.Log?.LogWarning(
+                "Could not find the player's food list; hunger detection is off.");
+            return null;
+        }
+
+        // Hungry = no active food in any of the food slots.
+        public static bool IsHungry(Player player)
+        {
+            if (GetFoods == null)
+                return false;
+
+            ICollection foods = GetFoods(player);
+            return foods != null && foods.Count == 0;
+        }
+
+        public static void ResetTimers()
+        {
+            _lastHungerTick = -1f;
+            _loadedAt = Time.time;
+        }
+
+        public static void DebugApply(float amount)
+        {
+            Burned += amount;
+            OutwardSurvivalPlugin.Log.LogInfo($"Debug: added {amount:F1} burned health (now {Burned:F1}).");
+        }
+
+        public static void Clear(string reason)
+        {
+            if (Burned > 0f)
+                OutwardSurvivalPlugin.Log.LogInfo($"Burned health cleared ({reason}).");
+
+            Burned = 0f;
+        }
+
+        // Restore some burned health (never more than there is).
+        private static void Restore(float amount, string reason)
+        {
+            if (amount <= 0f || Burned <= 0f)
+                return;
+
+            float restored = Mathf.Min(amount, Burned);
+            Burned -= restored;
+
+            OutwardSurvivalPlugin.Log.LogInfo(
+                $"Burned health restored by {restored:F1} ({reason}); {Burned:F1} left.");
+        }
+
+        // Called when the local player wakes up from sleeping.
+        public static void OnWakeUp()
+        {
+            float percent = OutwardSurvivalPlugin.SleepHealthRestorePercent.Value;
+            if (percent > 0f)
+                Restore(Burned * percent / 100f, "slept");
+        }
+
+        // Called when a healing effect (potion) starts on the local player.
+        public static void OnHealingEffect(SE_Stats effect)
+        {
+            // Status effects restored while loading a character are not new potions.
+            if (Time.time - _loadedAt < 3f)
+                return;
+
+            float healing = effect.m_healthUpFront + effect.m_healthOverTime;
+            if (healing <= 0f)
+                return;
+
+            Restore(healing * OutwardSurvivalPlugin.PotionHealthRestorePercent.Value / 100f,
+                $"healing potion, {healing:F0} healing");
+        }
+
+        // Called just before the local player's health is set. A drop is damage; burn part of it.
+        public static void OnHealthSet(Player player, float newHealth)
+        {
+            if (Time.frameCount == IgnoreDecreaseFrame)
+                return;
+
+            float current = player.GetHealth();
+            float max = player.GetMaxHealth();
+
+            // Healing, or no change.
+            if (newHealth >= current)
+                return;
+
+            // Health being clamped down to a lowered max is not damage.
+            if (newHealth >= max - 0.001f)
+                return;
+
+            float damage = current - Mathf.Max(0f, newHealth);
+            if (damage <= 0f)
+                return;
+
+            float rate = OutwardSurvivalPlugin.HealthBurnPercent.Value / 100f;
+            bool hungry = OutwardSurvivalPlugin.HungerPenalties.Value && IsHungry(player);
+            if (hungry)
+                rate *= OutwardSurvivalPlugin.HungryBurnMultiplier.Value;
+            rate = Mathf.Clamp01(rate);
+
+            float burn = damage * rate;
+            Burned += burn;
+
+            if (OutwardSurvivalPlugin.DebugLogHealth.Value)
+                OutwardSurvivalPlugin.Log.LogInfo(
+                    $"[Health] took {damage:F1} damage{(hungry ? " (hungry)" : "")}: burned +{burn:F2} (total {Burned:F2}).");
+        }
+
+        // Slow max health burn while hungry. Called about once per second.
+        public static void HungerTick(Player player)
+        {
+            float now = Time.time;
+            bool first = _lastHungerTick < 0f;
+            float dt = now - _lastHungerTick;
+            _lastHungerTick = now;
+
+            if (first || dt <= 0f || dt > 3f)
+                return;
+
+            if (!OutwardSurvivalPlugin.HungerPenalties.Value || !IsHungry(player))
+                return;
+
+            Burned += OutwardSurvivalPlugin.HungerHealthBurnPerSecond.Value * dt;
+        }
+
+        // The local player deals less damage while hungry.
+        public static void ApplyHungryDamagePenalty(HitData hit)
+        {
+            Player local = Player.m_localPlayer;
+            if (local == null || !OutwardSurvivalPlugin.HungerPenalties.Value || !IsHungry(local))
+                return;
+
+            float factor = Mathf.Clamp01(1f - OutwardSurvivalPlugin.HungryDamageReduction.Value / 100f);
+            Scale(ref hit.m_damage, factor);
+        }
+
+        private static void Scale(ref HitData.DamageTypes d, float f)
+        {
+            d.m_damage *= f;
+            d.m_blunt *= f;
+            d.m_slash *= f;
+            d.m_pierce *= f;
+            d.m_chop *= f;
+            d.m_pickaxe *= f;
+            d.m_fire *= f;
+            d.m_frost *= f;
+            d.m_lightning *= f;
+            d.m_poison *= f;
+            d.m_spirit *= f;
+        }
+    }
+
+    internal static class StaminaBurn
+    {
+        private const string SaveKey = "OutwardSurvival.BurnedStamina";
+
+        // Live counter, updated on every stamina spend.
+        public static float Burned;
+
+        // Burn actually subtracted from max stamina at the last food update.
+        // The HUD uses this so the bar matches the real max stamina.
+        public static float Applied;
+
+        // While Time.time is below this, the stamina HUD is held visible.
+        public static float RegenVisibleUntil;
+
+        private static bool _wasRested;
+        private static bool _restedInitialized;
+        private static float _lastRemaining;
+        private static float _lastRegenTime = -1f;
+        private static float _lastCombatTime = -999f;
+
+        // Name of the character that just died, so the respawn keeps the live burn values.
+        private static string _deathCharacter;
+
+        // Cached status effect checks used when stamina is spent.
+        private static float _effectsCheckedAt = -999f;
+        private static bool _corpseRun;
+        private static bool _poisoned;
+
+        // Looked up by name so a typo or rename in the game's code can't break compilation.
+        private static readonly Func<StatusEffect, float> GetRemaining = BuildRemainingGetter();
+        private static readonly Func<Player, bool> IsTargeted =
+            BuildPlayerBool("IsTargeted", "enemy-targeting detection for combat is off");
+        private static readonly Func<Player, bool> IsEncumberedCheck =
+            BuildPlayerBool("IsEncumbered", "the direct encumbered check is off (the status effect is still checked)");
+
+        private static Func<StatusEffect, float> BuildRemainingGetter()
+        {
+            foreach (string name in new[] { "GetRemaningTime", "GetRemainingTime" })
+            {
+                MethodInfo method = AccessTools.Method(typeof(StatusEffect), name);
+                if (method != null && method.ReturnType == typeof(float))
+                {
+                    try
+                    {
+                        return (Func<StatusEffect, float>)Delegate.CreateDelegate(
+                            typeof(Func<StatusEffect, float>), method);
+                    }
+                    catch (ArgumentException)
+                    {
+                    }
+                }
+            }
+
+            OutwardSurvivalPlugin.Log?.LogWarning(
+                "Could not find the status effect remaining-time method; " +
+                "Rested refresh detection is off (only gaining Rested will be detected).");
+            return null;
+        }
+
+        private static Func<Player, bool> BuildPlayerBool(string name, string consequence)
+        {
+            MethodInfo method = AccessTools.Method(typeof(Player), name);
+            if (method != null && method.ReturnType == typeof(bool) && method.GetParameters().Length == 0)
+            {
+                try
+                {
+                    return (Func<Player, bool>)Delegate.CreateDelegate(typeof(Func<Player, bool>), method);
+                }
+                catch (ArgumentException)
+                {
+                }
+            }
+
+            OutwardSurvivalPlugin.Log?.LogWarning($"Player.{name}() not found; {consequence}.");
+            return null;
+        }
+
+        public static void OnStaminaSpent(Player player, float amount)
+        {
+            if (amount <= 0f)
+                return;
+
+            RefreshEffects(player);
+
+            // Corpse Run: stamina use doesn't burn anything.
+            if (OutwardSurvivalPlugin.NoBurnDuringCorpseRun.Value && _corpseRun)
+                return;
+
+            float rate = OutwardSurvivalPlugin.BurnPercent.Value / 100f;
+
+            // Poisoned: the burn rate is multiplied.
+            if (OutwardSurvivalPlugin.PoisonBoostsBurn.Value && _poisoned)
+                rate *= OutwardSurvivalPlugin.PoisonBurnMultiplier.Value;
+
+            Burned += amount * rate;
+        }
+
+        // Re-check the status effects used by the burn rules, at most twice a second.
+        private static void RefreshEffects(Player player)
+        {
+            float now = Time.time;
+            if (now - _effectsCheckedAt < 0.5f)
+                return;
+            _effectsCheckedAt = now;
+
+            bool corpseRun = false;
+            bool poisoned = false;
+            foreach (StatusEffect se in player.GetSEMan().GetStatusEffects())
+            {
+                if (IsEffect(se, "CorpseRun", "$se_corpserun_name"))
+                    corpseRun = true;
+                else if (IsEffect(se, "Poison", "$se_poison_name"))
+                    poisoned = true;
+            }
+
+            _corpseRun = corpseRun;
+            _poisoned = poisoned;
+        }
+
+        public static void DebugApply(float amount)
+        {
+            Burned += amount;
+            OutwardSurvivalPlugin.Log.LogInfo($"Debug: added {amount:F1} burned stamina (now {Burned:F1}).");
+        }
+
+        public static void MarkCombat()
+        {
+            _lastCombatTime = Time.time;
+        }
+
+        // Comma-separated names of the player's active status effects (debug only).
+        public static string DescribeEffects(Player player)
+        {
+            StringBuilder sb = new StringBuilder();
+            foreach (StatusEffect se in player.GetSEMan().GetStatusEffects())
+            {
+                if (sb.Length > 0)
+                    sb.Append(", ");
+                sb.Append(se.name);
+            }
+            return sb.Length > 0 ? sb.ToString() : "none";
+        }
+
+        private static string CurrentCharacterName()
+        {
+            if (Game.instance == null)
+                return null;
+
+            PlayerProfile profile = Game.instance.GetPlayerProfile();
+            return profile != null ? profile.GetName() : null;
+        }
+
+        // Called when the local player dies.
+        public static void OnLocalDeath()
+        {
+            if (OutwardSurvivalPlugin.ResetOnDeath.Value)
+                Clear("died");
+
+            if (OutwardSurvivalPlugin.ResetHealthOnDeath.Value)
+                HealthBurn.Clear("died");
+
+            // Remember who died, so the respawn keeps the live values instead of older saved ones.
+            _deathCharacter = CurrentCharacterName();
+        }
+
+        // Persistence in the character's own save data.
+        public static void LoadFrom(Player player)
+        {
+            // Treat whatever Rested state exists right after loading as the starting point,
+            // not as a newly gained buff.
+            _restedInitialized = false;
+            _lastRegenTime = -1f;
+            HealthBurn.ResetTimers();
+
+            // Respawning after a death: keep the values we already have.
+            string name = CurrentCharacterName();
+            if (_deathCharacter != null && _deathCharacter == name)
+            {
+                _deathCharacter = null;
+                OutwardSurvivalPlugin.Log.LogInfo(
+                    $"Respawned; burn carried over: stamina {Burned:F1}, health {HealthBurn.Burned:F1}");
+                return;
+            }
+            _deathCharacter = null;
+
+            float value = 0f;
+            string text;
+            if (player.m_customData.TryGetValue(SaveKey, out text))
+                float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+
+            Burned = Mathf.Max(0f, value);
+            Applied = 0f;
+
+            float healthValue = 0f;
+            if (player.m_customData.TryGetValue(HealthBurn.SaveKey, out text))
+                float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out healthValue);
+
+            HealthBurn.Burned = Mathf.Max(0f, healthValue);
+            HealthBurn.Applied = 0f;
+
+            OutwardSurvivalPlugin.Log.LogInfo(
+                $"Loaded burn from character data: stamina {Burned:F1}, health {HealthBurn.Burned:F1}");
+        }
+
+        public static void SaveTo(Player player)
+        {
+            player.m_customData[SaveKey] = Burned.ToString("R", CultureInfo.InvariantCulture);
+            player.m_customData[HealthBurn.SaveKey] = HealthBurn.Burned.ToString("R", CultureInfo.InvariantCulture);
+        }
+
+        // Detect the Rested buff being gained or refreshed.
+        public static void CheckRested(Player player)
+        {
+            SE_Rested rested = FindRested(player);
+            bool has = rested != null;
+
+            float remaining = 0f;
+            if (has && GetRemaining != null)
+                remaining = GetRemaining(rested);
+
+            if (!_restedInitialized)
+            {
+                _restedInitialized = true;
+                _wasRested = has;
+                _lastRemaining = remaining;
+                return;
+            }
+
+            bool gained = has && !_wasRested;
+            bool refreshed = has && _wasRested && GetRemaining != null && remaining > _lastRemaining + 1f;
+
+            if ((gained || refreshed) && OutwardSurvivalPlugin.ResetOnRested.Value)
+                Clear(gained ? "gained Rested" : "Rested refreshed");
+
+            _wasRested = has;
+            _lastRemaining = remaining;
+        }
+
+        private static SE_Rested FindRested(Player player)
+        {
+            foreach (StatusEffect se in player.GetSEMan().GetStatusEffects())
+            {
+                SE_Rested rested = se as SE_Rested;
+                if (rested != null)
+                    return rested;
+            }
+            return null;
+        }
+
+        // Slowly restore burned stamina while the player is sitting.
+        public static void Regenerate(Player player)
+        {
+            float now = Time.time;
+            bool firstCall = _lastRegenTime < 0f;
+            float dt = now - _lastRegenTime;
+            _lastRegenTime = now;
+
+            // Ignore the first call and long gaps (loading, pauses).
+            if (firstCall || dt <= 0f || dt > 3f || Burned <= 0f)
+                return;
+
+            if (!player.IsSitting())
+                return;
+
+            string blocked = BlockedBy(player);
+            if (blocked != null)
+            {
+                if (OutwardSurvivalPlugin.DebugLogStamina.Value)
+                    OutwardSurvivalPlugin.Log.LogInfo($"[Stamina] recovery blocked: {blocked}.");
+                return;
+            }
+
+            float rate = OutwardSurvivalPlugin.RestorePerSecond.Value;
+
+            // Near a fire: the game's own heat area, the same check that gives the Warm status.
+            if (EffectArea.IsPointInsideArea(player.transform.position, EffectArea.Type.Heat, 0.5f))
+                rate += OutwardSurvivalPlugin.FireBonusPerSecond.Value;
+
+            if (OutwardSurvivalPlugin.ScaleWithComfort.Value)
+                rate *= Mathf.Max(1, player.GetComfortLevel());
+
+            float before = Burned;
+            Burned = Mathf.Max(0f, Burned - rate * dt);
+
+            // Keep the stamina HUD on screen while burn is coming back.
+            if (Burned < before)
+                RegenVisibleUntil = now + 1.5f;
+        }
+
+        // Returns why recovery is blocked right now, or null if it isn't.
+        private static string BlockedBy(Player player)
+        {
+            if (OutwardSurvivalPlugin.BlockInCombat.Value && InCombat(player))
+                return "in combat";
+
+            if (OutwardSurvivalPlugin.BlockWhenEncumbered.Value &&
+                IsEncumberedCheck != null && IsEncumberedCheck(player))
+                return "encumbered";
+
+            foreach (StatusEffect se in player.GetSEMan().GetStatusEffects())
+            {
+                if (OutwardSurvivalPlugin.BlockWhenWet.Value && IsEffect(se, "Wet", "$se_wet_name"))
+                    return "wet";
+                if (OutwardSurvivalPlugin.BlockWhenFreezing.Value && IsEffect(se, "Freezing", "$se_freezing_name"))
+                    return "freezing";
+                if (OutwardSurvivalPlugin.BlockWhenCold.Value && IsEffect(se, "Cold", "$se_cold_name"))
+                    return "cold";
+                if (OutwardSurvivalPlugin.BlockWhenEncumbered.Value && IsEffect(se, "Encumbered", "$se_encumbered_name"))
+                    return "encumbered";
+            }
+
+            return null;
+        }
+
+        private static bool InCombat(Player player)
+        {
+            if (Time.time - _lastCombatTime < OutwardSurvivalPlugin.CombatCooldown.Value)
+                return true;
+
+            if (IsTargeted != null && IsTargeted(player))
+            {
+                _lastCombatTime = Time.time;
+                return true;
+            }
+
+            return false;
+        }
+
+        // Exact match on the effect's asset name (ignoring "(Clone)") or its display token.
+        private static bool IsEffect(StatusEffect se, string assetName, string token)
+        {
+            if (se.m_name == token)
+                return true;
+
+            string n = se.name;
+            if (n == null)
+                return false;
+
+            if (n.EndsWith("(Clone)", StringComparison.Ordinal))
+                n = n.Substring(0, n.Length - "(Clone)".Length);
+
+            return string.Equals(n.Trim(), assetName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static void Clear(string reason)
+        {
+            if (Burned > 0f)
+            {
+                OutwardSurvivalPlugin.Log.LogInfo($"Burned stamina cleared ({reason}).");
+
+                // Show the stamina HUD briefly so the player sees the burn go away.
+                RegenVisibleUntil = Time.time + 2f;
+            }
+
+            Burned = 0f;
+        }
+    }
+
+    [HarmonyPatch(typeof(Player), "Awake")]
+    internal static class Player_Awake_Patch
+    {
+        private static void Postfix(Player __instance)
+        {
+            __instance.m_baseHP = OutwardSurvivalPlugin.BaseHealth.Value;
+            __instance.m_baseStamina = OutwardSurvivalPlugin.BaseStamina.Value;
+
+            OutwardSurvivalPlugin.Log.LogInfo(
+                $"Player.Awake patched: HP={__instance.m_baseHP}, Stamina={__instance.m_baseStamina}");
+        }
+    }
+
+    // Restore the burned amounts from the character's save data.
+    [HarmonyPatch]
+    internal static class Player_Load_Patch
+    {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(Player), "Load", new[] { typeof(ZPackage) });
+        }
+
+        private static bool Prepare()
+        {
+            return PatchHelper.Found(TargetMethod(), "Player.Load(ZPackage)");
+        }
+
+        private static void Postfix(Player __instance)
+        {
+            StaminaBurn.LoadFrom(__instance);
+        }
+    }
+
+    // Write the burned amounts into the character's save data right before it is saved.
+    [HarmonyPatch]
+    internal static class Player_Save_Patch
+    {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(Player), "Save", new[] { typeof(ZPackage) });
+        }
+
+        private static bool Prepare()
+        {
+            return PatchHelper.Found(TargetMethod(), "Player.Save(ZPackage)");
+        }
+
+        private static void Prefix(Player __instance)
+        {
+            StaminaBurn.SaveTo(__instance);
+        }
+    }
+
+    // Handle the local player dying (optionally clearing the burn).
+    // This runs before the original method, so anything the game saves during death sees the result.
+    [HarmonyPatch]
+    internal static class Player_OnDeath_Patch
+    {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(Player), "OnDeath");
+        }
+
+        private static bool Prepare()
+        {
+            return PatchHelper.Found(TargetMethod(), "Player.OnDeath");
+        }
+
+        private static void Prefix(Player __instance)
+        {
+            if (__instance == Player.m_localPlayer)
+                StaminaBurn.OnLocalDeath();
+        }
+    }
+
+    // Burn a percentage of every point of stamina the local player spends.
+    [HarmonyPatch(typeof(Player), "UseStamina")]
+    internal static class Player_UseStamina_Patch
+    {
+        private static void Prefix(Player __instance, float v)
+        {
+            if (__instance != Player.m_localPlayer)
+                return;
+
+            // Only count stamina that was actually available to spend.
+            StaminaBurn.OnStaminaSpent(__instance, Mathf.Min(v, __instance.GetStamina()));
+        }
+    }
+
+    // Damage taken burns max health: watch the local player's health drop.
+    [HarmonyPatch]
+    internal static class Character_SetHealth_Patch
+    {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(Character), "SetHealth", new[] { typeof(float) });
+        }
+
+        private static bool Prepare()
+        {
+            return PatchHelper.Found(TargetMethod(), "Character.SetHealth(float)");
+        }
+
+        private static void Prefix(Character __instance, float __0)
+        {
+            Player local = Player.m_localPlayer;
+            if (local == null || __instance != local)
+                return;
+
+            HealthBurn.OnHealthSet(local, __0);
+        }
+    }
+
+    // Healing potions restore some burned health when they start.
+    // Prepare() skips this patch if SE_Stats doesn't declare its own Setup method.
+    [HarmonyPatch]
+    internal static class SE_Stats_Setup_Patch
+    {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.DeclaredMethod(typeof(SE_Stats), "Setup", new[] { typeof(Character) });
+        }
+
+        private static bool Prepare()
+        {
+            return PatchHelper.Found(TargetMethod(), "SE_Stats.Setup(Character)");
+        }
+
+        private static void Postfix(SE_Stats __instance, Character __0)
+        {
+            if (__0 == null || __0 != Player.m_localPlayer)
+                return;
+
+            HealthBurn.OnHealingEffect(__instance);
+        }
+    }
+
+    // The game calls this about once per second: check Rested, restore burn, apply the burns.
+    // __0 is the "hp" out value (max health from food); positional so its name doesn't matter.
+    [HarmonyPatch(typeof(Player), "GetTotalFoodValue")]
+    internal static class Player_GetTotalFoodValue_Patch
+    {
+        private static void Postfix(Player __instance, ref float __0, ref float stamina)
+        {
+            if (__instance != Player.m_localPlayer)
+                return;
+
+            StaminaBurn.CheckRested(__instance);
+            StaminaBurn.Regenerate(__instance);
+            HealthBurn.HungerTick(__instance);
+
+            // Stamina: subtract the burn from max stamina.
+            float room = Mathf.Max(0f, stamina - OutwardSurvivalPlugin.MinMaxStamina.Value);
+            StaminaBurn.Burned = Mathf.Clamp(StaminaBurn.Burned, 0f, room);
+            StaminaBurn.Applied = StaminaBurn.Burned;
+            stamina -= StaminaBurn.Applied;
+
+            // Health: subtract the burn from max health, never below the minimum.
+            float healthRoom = Mathf.Max(0f, __0 - OutwardSurvivalPlugin.MinMaxHealth.Value);
+            HealthBurn.Burned = Mathf.Clamp(HealthBurn.Burned, 0f, healthRoom);
+
+            // The game clamps current health down right after max health drops; that isn't damage.
+            if (HealthBurn.Burned > HealthBurn.Applied + 0.01f)
+                HealthBurn.IgnoreDecreaseFrame = Time.frameCount;
+
+            HealthBurn.Applied = HealthBurn.Burned;
+            __0 -= HealthBurn.Applied;
+
+            if (OutwardSurvivalPlugin.DebugLogStamina.Value)
+                OutwardSurvivalPlugin.Log.LogInfo(
+                    $"[Stamina] max={stamina:F1}, burned={StaminaBurn.Applied:F2}, " +
+                    $"effects=[{StaminaBurn.DescribeEffects(__instance)}]");
+
+            if (OutwardSurvivalPlugin.DebugLogHealth.Value)
+                OutwardSurvivalPlugin.Log.LogInfo(
+                    $"[Health] max={__0:F1}, burned={HealthBurn.Applied:F2}, " +
+                    $"hungry={HealthBurn.IsHungry(__instance)}");
+        }
+    }
+
+    // Waking up from sleeping clears the stamina burn and restores burned health.
+    [HarmonyPatch(typeof(Player), "SetSleeping")]
+    internal static class Player_SetSleeping_Patch
+    {
+        private static void Prefix(Player __instance, out bool __state)
+        {
+            __state = __instance.IsSleeping();
+        }
+
+        private static void Postfix(Player __instance, bool sleep, bool __state)
+        {
+            if (__instance == Player.m_localPlayer && __state && !sleep)
+            {
+                StaminaBurn.Clear("woke up");
+                HealthBurn.OnWakeUp();
+            }
+        }
+    }
+
+    // Combat tracking (dealing or taking damage) and the hungry damage penalty.
+    [HarmonyPatch]
+    internal static class Character_Damage_Patch
+    {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(Character), "Damage", new[] { typeof(HitData) });
+        }
+
+        private static bool Prepare()
+        {
+            return PatchHelper.Found(TargetMethod(), "Character.Damage(HitData)");
+        }
+
+        // Runs before the hit is processed: hungry players deal less damage to others.
+        private static void Prefix(Character __instance, HitData __0)
+        {
+            Player local = Player.m_localPlayer;
+            if (local == null || __0 == null || __instance == local)
+                return;
+
+            if (__0.GetAttacker() == local)
+                HealthBurn.ApplyHungryDamagePenalty(__0);
+        }
+
+        private static void Postfix(Character __instance, HitData __0)
+        {
+            Player local = Player.m_localPlayer;
+            if (local == null || __0 == null)
+                return;
+
+            if (__instance == local || __0.GetAttacker() == local)
+                StaminaBurn.MarkCombat();
+        }
+    }
+
+    // Optionally allow sleeping at any time of day.
+    // Prepare() skips this patch if the method doesn't exist in this game version.
+    [HarmonyPatch]
+    internal static class EnvMan_CanSleep_Patch
+    {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(EnvMan), "CanSleep");
+        }
+
+        private static bool Prepare()
+        {
+            return PatchHelper.Found(TargetMethod(), "EnvMan.CanSleep");
+        }
+
+        private static void Postfix(ref bool __result)
+        {
+            if (OutwardSurvivalPlugin.SleepAnytime.Value)
+                __result = true;
+        }
+    }
+
+    // Keep the stamina bar at full length and draw the burned part as a darker section.
+    [HarmonyPatch(typeof(Hud), "UpdateStamina")]
+    internal static class Hud_UpdateStamina_Patch
+    {
+        // Hud.SetStaminaBarSize is private, so call it through a cached delegate.
+        private static readonly Action<Hud, float> SetBarSize =
+            (Action<Hud, float>)Delegate.CreateDelegate(
+                typeof(Action<Hud, float>),
+                AccessTools.Method(typeof(Hud), "SetStaminaBarSize"));
+
+        private static readonly BarGradient Gradient = new BarGradient();
+
+        private static RectTransform _burnedBar;
+        private static UnityEngine.UI.Image _burnedImage;
+        private static float _alpha = 1f;
+        private static float _fullTimer;
+
+        private static void Postfix(Hud __instance, Player player)
+        {
+            float stamina = player.GetStamina();
+            float maxStamina = player.GetMaxStamina();
+            float burned = StaminaBurn.Applied;
+            float total = maxStamina + burned;
+
+            if (total <= 0f)
+                return;
+
+            // Same size formula the game uses, but for max + burned so the bar never shrinks.
+            SetBarSize(__instance, total / 25f * 32f);
+
+            // Fill is now a fraction of the full-length bar.
+            __instance.m_staminaBar2Slow.SetValue(stamina / total);
+            __instance.m_staminaBar2Fast.SetValue(stamina / total);
+
+            // While burned stamina is coming back, keep the whole stamina display on screen.
+            bool recovering = Time.time < StaminaBurn.RegenVisibleUntil;
+            if (recovering && __instance.m_staminaAnimator != null)
+                __instance.m_staminaAnimator.SetBool("Visible", true);
+
+            UpdateBurnedBar(__instance, burned, stamina, maxStamina, recovering);
+        }
+
+        private static void UpdateBurnedBar(Hud hud, float burned, float stamina, float maxStamina, bool recovering)
+        {
+            // (Re)create the overlay if it doesn't exist yet or the HUD was rebuilt.
+            if (_burnedBar == null)
+            {
+                GameObject go = new GameObject("BurnedStaminaBar",
+                    typeof(RectTransform), typeof(CanvasRenderer), typeof(UnityEngine.UI.Image));
+                go.transform.SetParent(hud.m_staminaBar2Root.transform, false);
+
+                _burnedBar = go.GetComponent<RectTransform>();
+                _burnedImage = go.GetComponent<UnityEngine.UI.Image>();
+                _burnedImage.raycastTarget = false;
+                _burnedImage.type = UnityEngine.UI.Image.Type.Simple;
+
+                // Anchor to the right edge, full height.
+                _burnedBar.anchorMin = new Vector2(1f, 0f);
+                _burnedBar.anchorMax = new Vector2(1f, 1f);
+                _burnedBar.pivot = new Vector2(1f, 0.5f);
+
+                HudUtil.PlaceBehind(_burnedBar, hud.m_staminaBar2Root.transform, hud.m_staminaBar2Slow.transform);
+            }
+
+            // Own full-stamina timer, mirroring the game's hide timer but with a shorter delay,
+            // so the burned section fades out before the regular bar does.
+            // It stays at zero while burn is recovering.
+            if (recovering || stamina < maxStamina - 0.01f)
+                _fullTimer = 0f;
+            else
+                _fullTimer += Time.deltaTime;
+
+            bool gameVisible = hud.m_staminaAnimator == null || hud.m_staminaAnimator.GetBool("Visible");
+            bool wanted = gameVisible && _fullTimer < OutwardSurvivalPlugin.HideDelay.Value;
+
+            _alpha = Mathf.MoveTowards(_alpha, wanted ? 1f : 0f,
+                OutwardSurvivalPlugin.FadeSpeed.Value * Time.deltaTime);
+
+            bool visible = burned > 0.01f && _alpha > 0.001f;
+            _burnedBar.gameObject.SetActive(visible);
+            if (!visible)
+                return;
+
+            // Position and size are applied every update so the config sliders take effect live.
+            // Width uses the same units as SetStaminaBarSize.
+            float width = Mathf.Max(0f, burned / 25f * 32f + OutwardSurvivalPlugin.BarWidthAdjust.Value);
+            _burnedBar.sizeDelta = new Vector2(width, OutwardSurvivalPlugin.BarHeightAdjust.Value);
+            _burnedBar.anchoredPosition = new Vector2(
+                OutwardSurvivalPlugin.BarOffsetX.Value,
+                OutwardSurvivalPlugin.BarOffsetY.Value);
+
+            _burnedImage.sprite = Gradient.Get(OutwardSurvivalPlugin.GradientStrength.Value);
+
+            // Darker version of the bar's own color; the gradient texture darkens the bottom.
+            UnityEngine.UI.Image source =
+                hud.m_staminaBar2Fast.GetComponentInChildren<UnityEngine.UI.Image>();
+            Color c = source != null ? source.color : _burnedImage.color;
+            float b = OutwardSurvivalPlugin.BurnedBarBrightness.Value;
+
+            // Smoothstep easing so the fade starts and ends gently.
+            float eased = _alpha * _alpha * (3f - 2f * _alpha);
+
+            _burnedImage.color = new Color(
+                c.r * b, c.g * b, c.b * b,
+                eased * OutwardSurvivalPlugin.BarOpacity.Value);
+        }
+    }
+
+    // Replaces the game's UpdateHealth so the health bars only ever receive one set of values per frame.
+    // (Running the original and then correcting it made the "recent damage" trail flash.)
+    // The original method only did four things: size the bar, set both bars, and write the health number.
+    [HarmonyPatch(typeof(Hud), "UpdateHealth")]
+    internal static class Hud_UpdateHealth_Patch
+    {
+        // Hud.SetHealthBarSize is private, so call it through a cached delegate.
+        private static readonly Action<Hud, float> SetBarSize =
+            (Action<Hud, float>)Delegate.CreateDelegate(
+                typeof(Action<Hud, float>),
+                AccessTools.Method(typeof(Hud), "SetHealthBarSize"));
+
+        private static readonly BarGradient Gradient = new BarGradient();
+
+        // The health number's text object is a TextMeshPro type. Reaching it by reflection means
+        // this project doesn't need a reference to the TextMeshPro assembly.
+        private static readonly FieldInfo HealthTextField = AccessTools.Field(typeof(Hud), "m_healthText");
+
+        private static RectTransform _burnedBar;
+        private static UnityEngine.UI.Image _burnedImage;
+        private static Component _textComponent;
+        private static PropertyInfo _textProperty;
+        private static int _lastShown = int.MinValue;
+
+        // Returning false skips the game's own UpdateHealth.
+        private static bool Prefix(Hud __instance, Player player)
+        {
+            float maxHealth = player.GetMaxHealth();
+            float burned = HealthBurn.Applied;
+            float total = maxHealth + burned;
+            float health = player.GetHealth();
+
+            // Same size formula the game uses, but for max + burned so the bar never shrinks.
+            SetBarSize(__instance, total / 25f * 32f);
+
+            // The bars take absolute values, so give them the full-length maximum.
+            __instance.m_healthBarFast.SetMaxValue(total);
+            __instance.m_healthBarFast.SetValue(health);
+            __instance.m_healthBarSlow.SetMaxValue(total);
+            __instance.m_healthBarSlow.SetValue(health);
+
+            SetHealthText(__instance, Mathf.CeilToInt(health));
+
+            UpdateBurnedBar(__instance, burned);
+            return false;
+        }
+
+        // Writes the health number, only when it changed or the HUD created a new text object.
+        private static void SetHealthText(Hud hud, int shown)
+        {
+            if (HealthTextField == null)
+                return;
+
+            Component text = HealthTextField.GetValue(hud) as Component;
+            if (text == null)
+                return;
+
+            if (shown == _lastShown && text == _textComponent)
+                return;
+
+            if (text != _textComponent || _textProperty == null)
+            {
+                _textComponent = text;
+                _textProperty = text.GetType().GetProperty("text", typeof(string));
+            }
+
+            if (_textProperty == null)
+                return;
+
+            _textProperty.SetValue(text, shown.ToString(CultureInfo.InvariantCulture), null);
+            _lastShown = shown;
+        }
+
+        private static void UpdateBurnedBar(Hud hud, float burned)
+        {
+            // (Re)create the overlay if it doesn't exist yet or the HUD was rebuilt.
+            if (_burnedBar == null)
+            {
+                GameObject go = new GameObject("BurnedHealthBar",
+                    typeof(RectTransform), typeof(CanvasRenderer), typeof(UnityEngine.UI.Image));
+                go.transform.SetParent(hud.m_healthBarRoot, false);
+
+                _burnedBar = go.GetComponent<RectTransform>();
+                _burnedImage = go.GetComponent<UnityEngine.UI.Image>();
+                _burnedImage.raycastTarget = false;
+                _burnedImage.type = UnityEngine.UI.Image.Type.Simple;
+
+                // Anchor to the right edge, full height.
+                _burnedBar.anchorMin = new Vector2(1f, 0f);
+                _burnedBar.anchorMax = new Vector2(1f, 1f);
+                _burnedBar.pivot = new Vector2(1f, 0.5f);
+
+                // Above the "recent damage" trail bar, below the real health fill, so the trail
+                // can't show through the burned section.
+                HudUtil.PlaceBetween(_burnedBar, hud.m_healthBarRoot,
+                    hud.m_healthBarSlow.transform, hud.m_healthBarFast.transform);
+
+                if (OutwardSurvivalPlugin.DebugLogHealth.Value)
+                {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < hud.m_healthBarRoot.childCount; i++)
+                        sb.Append(i).Append(':').Append(hud.m_healthBarRoot.GetChild(i).name).Append("  ");
+
+                    OutwardSurvivalPlugin.Log.LogInfo(
+                        $"[Health] bar root children: {sb}| burned section index {_burnedBar.GetSiblingIndex()}");
+                }
+            }
+
+            bool visible = burned > 0.01f;
+            _burnedBar.gameObject.SetActive(visible);
+            if (!visible)
+                return;
+
+            // Position and size are applied every update so the config sliders take effect live.
+            // Width uses the same units as SetHealthBarSize.
+            float width = Mathf.Max(0f, burned / 25f * 32f + OutwardSurvivalPlugin.HealthBarWidthAdjust.Value);
+            _burnedBar.sizeDelta = new Vector2(width, OutwardSurvivalPlugin.HealthBarHeightAdjust.Value);
+            _burnedBar.anchoredPosition = new Vector2(
+                OutwardSurvivalPlugin.HealthBarOffsetX.Value,
+                OutwardSurvivalPlugin.HealthBarOffsetY.Value);
+
+            _burnedImage.sprite = Gradient.Get(OutwardSurvivalPlugin.HealthBarGradientStrength.Value);
+
+            Color c = OutwardSurvivalPlugin.HealthBarColor.Value;
+            _burnedImage.color = new Color(c.r, c.g, c.b, c.a * OutwardSurvivalPlugin.HealthBarOpacity.Value);
+        }
+    }
+}
