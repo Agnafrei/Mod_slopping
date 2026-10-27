@@ -1,0 +1,680 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Text;
+using BepInEx;
+using BepInEx.Configuration;
+using HarmonyLib;
+using UnityEngine;
+
+namespace HingesConfig
+{
+    [BepInPlugin(Guid, "HingesConfig", "1.3.0")]
+    public class HingesConfigPlugin : BaseUnityPlugin
+    {
+        public const string Guid = "valheim.hingesconfig";
+
+        // ZDO keys. Direction lock: 0 = free (vanilla), 1 / -1 = locked to that door state. Link: 0 / 1.
+        internal static readonly int LockKey = "OneWayDoors_Dir".GetStableHashCode();
+        internal static readonly int LinkKey = "OneWayDoors_Link".GetStableHashCode();
+
+        internal static ConfigEntry<bool> HideConfigGui;
+        internal static ConfigEntry<float> HideGuiHoldSeconds;
+        internal static ConfigEntry<float> AutoCloseSeconds;
+        internal static ConfigEntry<float> LinkHoldSeconds;
+        internal static ConfigEntry<float> MaxPairDistance;
+        internal static ConfigEntry<bool> MuteLinkedDoorSound;
+        internal static ConfigEntry<string> ModifierButtons;
+        internal static ConfigEntry<string> GamepadModifierLabel;
+        internal static ConfigEntry<bool> SwapLeftRight;
+        internal static ConfigEntry<bool> DebugInput;
+
+        private static readonly string[] DebugButtons =
+        {
+            "Use", "JoyUse", "AltPlace", "JoyAltPlace", "JoyAltKeys",
+            "JoyLTrigger", "JoyRTrigger", "JoyLBumper", "JoyRBumper"
+        };
+        private readonly Dictionary<string, bool> debugLast = new Dictionary<string, bool>();
+
+        private void Awake()
+        {
+            HideConfigGui = Config.Bind("General", "HideConfigGui", false,
+                "Hide the door settings lines in the hover prompt on all doors. " +
+                "Set to false again to bring them back.");
+            HideGuiHoldSeconds = Config.Bind("General", "HideGuiHoldSeconds", 5f,
+                new ConfigDescription("Seconds to hold the interact button on a door to hide the settings prompt.",
+                    new AcceptableValueRange<float>(1f, 30f)));
+            AutoCloseSeconds = Config.Bind("General", "AutoCloseSeconds", 10f,
+                new ConfigDescription("Seconds after which an open door or gate closes by itself. 0 disables auto close.",
+                    new AcceptableValueRange<float>(0f, 600f)));
+            SwapLeftRight = Config.Bind("General", "SwapLeftRight", false,
+                "Swap the 'right' and 'left' swing labels if they look mirrored on your doors.");
+
+            LinkHoldSeconds = Config.Bind("Double doors", "LinkHoldSeconds", 0.75f,
+                new ConfigDescription("Seconds to hold modifier + interact to toggle double door linking.",
+                    new AcceptableValueRange<float>(0.3f, 3f)));
+            MaxPairDistance = Config.Bind("Double doors", "MaxPairDistance", 4.5f,
+                new ConfigDescription("Maximum sideways distance (meters) to look for the neighbouring door of a pair.",
+                    new AcceptableValueRange<float>(1f, 10f)));
+            MuteLinkedDoorSound = Config.Bind("Double doors", "MuteLinkedDoorSound", true,
+                "When two linked doors move together, only the door you used plays its open/close sound. " +
+                "The door that follows it stays silent.");
+
+            ModifierButtons = Config.Bind("Input", "ModifierButtons", "AltPlace,JoyAltKeys,JoyLTrigger",
+                "Comma separated Valheim button names that count as the modifier (keyboard Shift and gamepad L2/LT). " +
+                "Unknown names are ignored. Turn on DebugInput to see which buttons are reported while you hold them.");
+            GamepadModifierLabel = Config.Bind("Input", "GamepadModifierLabel", "L2",
+                "Text shown in the prompt for the modifier while a gamepad is active.");
+            DebugInput = Config.Bind("Input", "DebugInput", false,
+                "Log every change of the main interaction/modifier buttons to the BepInEx log.");
+
+            new Harmony(Guid).PatchAll();
+        }
+
+        private void Update()
+        {
+            if (DebugInput.Value) LogButtons();
+
+            Player player = Player.m_localPlayer;
+            if (player == null)
+            {
+                DoorInput.Reset();
+                return;
+            }
+
+            // Nothing to do (and no input polling needed) unless a door is hovered or a press is pending.
+            if (!DoorInput.HasPending && DoorInput.GetHovered() == null)
+            {
+                DoorInput.HideHeld = 0f;
+                return;
+            }
+
+            float dt = Time.unscaledDeltaTime;
+            bool use = DoorInput.UseHeld();
+
+            // Modifier + interact was pressed on a door: tap = swing direction, hold = link toggle.
+            if (DoorInput.HasPending)
+            {
+                DoorInput.HideHeld = 0f;
+
+                if (Time.unscaledTime - DoorInput.PendingStart > 15f)
+                {
+                    DoorInput.ClearPending();
+                    return;
+                }
+
+                if (use)
+                {
+                    DoorInput.PendingHeld += dt;
+                    if (!DoorInput.PendingFired && DoorInput.PendingHeld >= LinkHoldSeconds.Value)
+                    {
+                        DoorInput.PendingFired = true;
+                        DoorActions.ToggleLink(DoorInput.PendingDoor, player);
+                    }
+                }
+                else
+                {
+                    if (!DoorInput.PendingFired)
+                        DoorActions.CycleDirection(DoorInput.PendingDoor, player);
+                    DoorInput.ClearPending();
+                }
+                return;
+            }
+
+            // Plain interact held on a hovered door: hide the settings prompt.
+            if (use && DoorInput.GetHovered() != null && !HideConfigGui.Value)
+            {
+                DoorInput.HideHeld += dt;
+                if (DoorInput.HideHeld >= HideGuiHoldSeconds.Value)
+                {
+                    HideConfigGui.Value = true;
+                    DoorInput.HideHeld = 0f;
+                    player.Message(MessageHud.MessageType.Center,
+                        "Door settings prompt hidden (set HideConfigGui = false in the config to show it again)");
+                }
+            }
+            else
+            {
+                DoorInput.HideHeld = 0f;
+            }
+        }
+
+        private void LogButtons()
+        {
+            foreach (string name in DebugButtons)
+            {
+                bool exists = DoorInput.ButtonExists(name);
+                bool held = exists && DoorInput.ButtonHeld(name);
+
+                if (!debugLast.TryGetValue(name, out bool last))
+                {
+                    debugLast[name] = held;
+                    Logger.LogInfo($"[input] button '{name}' exists: {exists}");
+                    last = held;
+                }
+
+                if (held != last)
+                {
+                    debugLast[name] = held;
+                    Logger.LogInfo($"[input] '{name}' {(held ? "pressed" : "released")}");
+                }
+            }
+        }
+    }
+
+    internal static class DoorInput
+    {
+        public static Door PendingDoor;
+        public static float PendingHeld;
+        public static float PendingStart;
+        public static bool PendingFired;
+        public static float HideHeld;
+        public static float LastHoldCall;
+
+        private static Door hovered;
+        private static float hoveredTime;
+
+        private static readonly FieldInfo ButtonsField = AccessTools.Field(typeof(ZInput), "m_buttons");
+        private static readonly Dictionary<string, bool> ExistsCache = new Dictionary<string, bool>();
+        private static string rawModifiers;
+        private static string[] modifierNames = new string[0];
+
+        public static bool HasPending => PendingDoor != null;
+
+        public static void BeginPending(Door door)
+        {
+            PendingDoor = door;
+            PendingHeld = 0f;
+            PendingFired = false;
+            PendingStart = Time.unscaledTime;
+        }
+
+        public static void ClearPending()
+        {
+            PendingDoor = null;
+            PendingHeld = 0f;
+            PendingFired = false;
+        }
+
+        public static void Reset()
+        {
+            ClearPending();
+            HideHeld = 0f;
+            hovered = null;
+        }
+
+        public static void SetHovered(Door door)
+        {
+            hovered = door;
+            hoveredTime = Time.unscaledTime;
+        }
+
+        // The hover text is rebuilt every frame, so a door is "hovered" if it was queried very recently.
+        public static Door GetHovered()
+        {
+            return (hovered != null && Time.unscaledTime - hoveredTime < 0.3f) ? hovered : null;
+        }
+
+        // Only query buttons the game actually knows, to avoid errors / log spam for unknown names.
+        public static bool ButtonExists(string name)
+        {
+            if (ExistsCache.TryGetValue(name, out bool known)) return known;
+            if (ZInput.instance == null) return false;
+
+            bool exists = true;
+            try
+            {
+                IDictionary dict = ButtonsField != null ? ButtonsField.GetValue(ZInput.instance) as IDictionary : null;
+                if (dict != null) exists = dict.Contains(name);
+            }
+            catch { exists = true; }
+
+            ExistsCache[name] = exists;
+            return exists;
+        }
+
+        public static bool ButtonHeld(string name)
+        {
+            if (!ButtonExists(name)) return false;
+            try { return ZInput.GetButton(name); }
+            catch
+            {
+                ExistsCache[name] = false;
+                return false;
+            }
+        }
+
+        // Interact button. Falls back to "the game is sending hold interactions" in case the
+        // button names differ in this game version.
+        public static bool UseHeld()
+        {
+            return ButtonHeld("Use") || ButtonHeld("JoyUse") || Time.unscaledTime - LastHoldCall < 0.25f;
+        }
+
+        // The modifier is polled directly instead of relying on the "alt" flag the game passes to
+        // Interact, because on a gamepad the game does not always set that flag for L2 / LT.
+        public static bool ModifierHeld()
+        {
+            string raw = HingesConfigPlugin.ModifierButtons.Value ?? "";
+            if (raw != rawModifiers)
+            {
+                rawModifiers = raw;
+                List<string> names = new List<string>();
+                foreach (string part in raw.Split(','))
+                {
+                    string trimmed = part.Trim();
+                    if (trimmed.Length > 0) names.Add(trimmed);
+                }
+                modifierNames = names.ToArray();
+            }
+
+            foreach (string name in modifierNames)
+                if (ButtonHeld(name)) return true;
+            return false;
+        }
+    }
+
+    internal static class DoorUtil
+    {
+        private static readonly AccessTools.FieldRef<Door, ZNetView> NView =
+            AccessTools.FieldRefAccess<Door, ZNetView>("m_nview");
+
+        public static ZNetView GetView(Door door) => NView(door);
+
+        public static bool IsValid(ZNetView nview) => nview != null && nview.IsValid();
+    }
+
+    internal static class DoorActions
+    {
+        private static readonly MethodInfo UpdateStateMethod = AccessTools.Method(typeof(Door), "UpdateState");
+
+        // All doors seen by the UpdateState tick (every loaded door runs it a few times a second).
+        private static readonly HashSet<Door> Registry = new HashSet<Door>();
+        private static readonly Dictionary<Door, KeyValuePair<float, Door>> PartnerCache =
+            new Dictionary<Door, KeyValuePair<float, Door>>();
+        private static float lastPurge;
+
+        public static void Register(Door door) => Registry.Add(door);
+
+        public static void PurgeIfDue(Dictionary<Door, float> openSince)
+        {
+            if (Time.time - lastPurge < 60f) return;
+            lastPurge = Time.time;
+
+            Registry.RemoveWhere(d => d == null);
+
+            List<Door> dead = new List<Door>();
+            foreach (Door d in PartnerCache.Keys) if (d == null) dead.Add(d);
+            foreach (Door d in dead) PartnerCache.Remove(d);
+
+            dead.Clear();
+            foreach (Door d in openSince.Keys) if (d == null) dead.Add(d);
+            foreach (Door d in dead) openSince.Remove(d);
+        }
+
+        // Door states are rotation senses around the hinge, so they do not depend on where the
+        // player stands. Two paired doors swing to the same physical side when their states are
+        // equal if both face the same way, and opposite if one is turned around (mirrored pair).
+        public static int Parity(Door a, Door b)
+        {
+            return Vector3.Dot(a.transform.forward, b.transform.forward) >= 0f ? 1 : -1;
+        }
+
+        // +1 / -1 are the two rotation senses around the hinge, seen from above:
+        // right = clockwise, left = counter-clockwise (flip with SwapLeftRight if mirrored).
+        public static string SwingLabel(int lockDir)
+        {
+            if (lockDir == 0) return "free";
+            bool right = lockDir > 0;
+            if (HingesConfigPlugin.SwapLeftRight.Value) right = !right;
+            return right ? "right" : "left";
+        }
+
+        private static readonly FieldInfo OpenEffectsField = AccessTools.Field(typeof(Door), "m_openEffects");
+        private static readonly FieldInfo CloseEffectsField = AccessTools.Field(typeof(Door), "m_closeEffects");
+
+        // Sets the door state and runs the door's own state update right away. With muteSound the
+        // door's open/close effect lists are swapped for empty ones just for that call, so the
+        // follower door of a linked pair moves silently.
+        public static void SetState(Door door, int state, bool muteSound = false)
+        {
+            ZNetView nview = DoorUtil.GetView(door);
+            if (!DoorUtil.IsValid(nview)) return;
+
+            nview.ClaimOwnership();
+            nview.GetZDO().Set(ZDOVars.s_state, state);
+
+            bool muted = muteSound && OpenEffectsField != null && CloseEffectsField != null;
+            object openEffects = null;
+            object closeEffects = null;
+            if (muted)
+            {
+                openEffects = OpenEffectsField.GetValue(door);
+                closeEffects = CloseEffectsField.GetValue(door);
+                EffectList silent = new EffectList();
+                OpenEffectsField.SetValue(door, silent);
+                CloseEffectsField.SetValue(door, silent);
+            }
+
+            try
+            {
+                UpdateStateMethod?.Invoke(door, null);
+            }
+            finally
+            {
+                if (muted)
+                {
+                    OpenEffectsField.SetValue(door, openEffects);
+                    CloseEffectsField.SetValue(door, closeEffects);
+                }
+            }
+        }
+
+        private static void ApplyLock(Door door, int lockDir)
+        {
+            ZNetView nview = DoorUtil.GetView(door);
+            if (!DoorUtil.IsValid(nview)) return;
+
+            nview.ClaimOwnership();
+            ZDO zdo = nview.GetZDO();
+            zdo.Set(HingesConfigPlugin.LockKey, lockDir);
+
+            // If the door is currently open on the wrong side, flip it to the locked side.
+            int state = zdo.GetInt(ZDOVars.s_state, 0);
+            if (state != 0 && lockDir != 0 && state != lockDir)
+            {
+                zdo.Set(ZDOVars.s_state, lockDir);
+                UpdateStateMethod?.Invoke(door, null);
+            }
+        }
+
+        // Finds the neighbouring door that forms a pair with this one: same prefab, same plane,
+        // side by side at the same height.
+        public static Door FindPartner(Door door, bool fresh = false)
+        {
+            if (!fresh && PartnerCache.TryGetValue(door, out KeyValuePair<float, Door> cached)
+                && Time.unscaledTime - cached.Key < 1f)
+            {
+                return cached.Value != null ? cached.Value : null;
+            }
+
+            Transform t = door.transform;
+            Vector3 pos = t.position;
+            Vector3 fwd = t.forward;
+            Vector3 right = t.right;
+            float maxDist = HingesConfigPlugin.MaxPairDistance.Value;
+            float maxSqr = maxDist * maxDist + 0.8f;
+            Door best = null;
+            float bestLateral = float.MaxValue;
+            string prefab = null;
+
+            // Cheap numeric rejections first; the (allocating) name comparison only for survivors.
+            foreach (Door other in Registry)
+            {
+                if (other == null || other == door) continue;
+
+                Transform ot = other.transform;
+                Vector3 d = ot.position - pos;
+                if (d.sqrMagnitude > maxSqr) continue;
+                if (Mathf.Abs(d.y) > 0.6f) continue;
+                if (Mathf.Abs(Vector3.Dot(fwd, ot.forward)) < 0.9f) continue;
+                if (Mathf.Abs(Vector3.Dot(d, fwd)) > 0.6f) continue;
+
+                float lateral = Mathf.Abs(Vector3.Dot(d, right));
+                if (lateral < 0.5f || lateral > maxDist || lateral >= bestLateral) continue;
+
+                if (prefab == null) prefab = door.gameObject.name;
+                if (other.gameObject.name != prefab) continue;
+
+                bestLateral = lateral;
+                best = other;
+            }
+
+            PartnerCache[door] = new KeyValuePair<float, Door>(Time.unscaledTime, best);
+            return best;
+        }
+
+        // Modifier + tap: free -> right -> left -> free. The lock is absolute (the door always
+        // swings the same way whichever side you open it from). A linked partner gets the
+        // mirrored lock so both leaves swing to the same physical side.
+        public static void CycleDirection(Door door, Player player)
+        {
+            if (door == null) return;
+            ZNetView nview = DoorUtil.GetView(door);
+            if (!DoorUtil.IsValid(nview)) return;
+            if (!PrivateArea.CheckAccess(door.transform.position)) return;
+
+            int current = nview.GetZDO().GetInt(HingesConfigPlugin.LockKey, 0);
+            int next = current == 0 ? 1 : (current == 1 ? -1 : 0);
+
+            ApplyLock(door, next);
+
+            bool mirrored = false;
+            if (nview.GetZDO().GetInt(HingesConfigPlugin.LinkKey, 0) == 1)
+            {
+                Door partner = FindPartner(door, true);
+                if (partner != null && PrivateArea.CheckAccess(partner.transform.position))
+                {
+                    ApplyLock(partner, next * Parity(door, partner));
+                    mirrored = true;
+                }
+            }
+
+            string msg = next == 0 ? "Door swings freely" : "Door now swings " + SwingLabel(next);
+            if (mirrored) msg += " (linked door mirrors it)";
+            player.Message(MessageHud.MessageType.Center, msg);
+        }
+
+        // Modifier + hold: link / unlink this door with its neighbour.
+        public static void ToggleLink(Door door, Player player)
+        {
+            if (door == null) return;
+            ZNetView nview = DoorUtil.GetView(door);
+            if (!DoorUtil.IsValid(nview)) return;
+
+            Door partner = FindPartner(door, true);
+            if (partner == null)
+            {
+                player.Message(MessageHud.MessageType.Center, "No neighbouring door found to link with");
+                return;
+            }
+
+            ZNetView partnerView = DoorUtil.GetView(partner);
+            if (!DoorUtil.IsValid(partnerView)) return;
+            if (!PrivateArea.CheckAccess(door.transform.position)) return;
+            if (!PrivateArea.CheckAccess(partner.transform.position)) return;
+
+            nview.ClaimOwnership();
+            partnerView.ClaimOwnership();
+
+            int next = nview.GetZDO().GetInt(HingesConfigPlugin.LinkKey, 0) == 0 ? 1 : 0;
+            nview.GetZDO().Set(HingesConfigPlugin.LinkKey, next);
+            partnerView.GetZDO().Set(HingesConfigPlugin.LinkKey, next);
+
+            if (next == 1)
+            {
+                // Make the two direction locks agree: this door's lock wins, else the partner's.
+                int parity = Parity(door, partner);
+                int lockThis = nview.GetZDO().GetInt(HingesConfigPlugin.LockKey, 0);
+                int lockPartner = partnerView.GetZDO().GetInt(HingesConfigPlugin.LockKey, 0);
+                int target = lockThis != 0 ? lockThis : lockPartner * parity;
+
+                ApplyLock(door, target);
+                ApplyLock(partner, target * parity);
+            }
+
+            player.Message(MessageHud.MessageType.Center,
+                next == 1 ? "Double door linked: both doors open together" : "Double door unlinked");
+        }
+
+        // After a door was used, make its linked partner follow it.
+        public static void SyncPartner(Door door)
+        {
+            ZNetView nview = DoorUtil.GetView(door);
+            if (!DoorUtil.IsValid(nview)) return;
+
+            ZDO zdo = nview.GetZDO();
+            if (zdo.GetInt(HingesConfigPlugin.LinkKey, 0) == 0) return;
+
+            Door partner = FindPartner(door);
+            if (partner == null) return;
+
+            int state = zdo.GetInt(ZDOVars.s_state, 0);
+            SetState(partner, state * Parity(door, partner), HingesConfigPlugin.MuteLinkedDoorSound.Value);
+        }
+    }
+
+    [HarmonyPatch(typeof(Door), nameof(Door.Interact))]
+    internal static class Door_Interact_Patch
+    {
+        // Modifier + Use (Shift on keyboard, L2 / LT on gamepad). The press is swallowed and
+        // resolved by the plugin's Update: a tap (released early) cycles the swing direction, a
+        // hold toggles double door linking.
+        private static bool Prefix(Door __instance, Humanoid character, bool hold, bool alt, ref bool __result)
+        {
+            if (character != Player.m_localPlayer) return true;
+
+            if (hold) DoorInput.LastHoldCall = Time.unscaledTime;
+
+            if (!alt && !DoorInput.ModifierHeld()) return true;
+
+            __result = !hold;
+            if (!hold && !DoorInput.HasPending)
+                DoorInput.BeginPending(__instance);
+            return false;
+        }
+
+        private static void Postfix(Door __instance, bool hold, bool __result)
+        {
+            if (!__result || hold) return;
+            DoorActions.SyncPartner(__instance);
+        }
+    }
+
+    // Vanilla writes the open state and then immediately calls UpdateState(), which starts the
+    // animation from that state. This tick also runs a few times a second on every loaded door,
+    // so it is used to enforce the direction lock (before the animation sees the state) and to
+    // run the auto close timer.
+    [HarmonyPatch(typeof(Door), "UpdateState")]
+    internal static class Door_UpdateState_Patch
+    {
+        private static readonly Dictionary<Door, float> OpenSince = new Dictionary<Door, float>();
+
+        private static void Prefix(Door __instance)
+        {
+            DoorActions.Register(__instance);
+            DoorActions.PurgeIfDue(OpenSince);
+
+            ZNetView nview = DoorUtil.GetView(__instance);
+            if (!DoorUtil.IsValid(nview) || !nview.IsOwner()) return;
+
+            ZDO zdo = nview.GetZDO();
+            int state = zdo.GetInt(ZDOVars.s_state, 0);
+
+            int lockDir = zdo.GetInt(HingesConfigPlugin.LockKey, 0);
+            if (state != 0 && lockDir != 0 && state != lockDir)
+            {
+                zdo.Set(ZDOVars.s_state, lockDir);
+                state = lockDir;
+            }
+
+            float delay = HingesConfigPlugin.AutoCloseSeconds.Value;
+            if (state == 0 || delay <= 0f)
+            {
+                OpenSince.Remove(__instance);
+                return;
+            }
+
+            if (!OpenSince.TryGetValue(__instance, out float since))
+            {
+                OpenSince[__instance] = Time.time;
+                return;
+            }
+
+            if (Time.time - since < delay) return;
+
+            OpenSince.Remove(__instance);
+            zdo.Set(ZDOVars.s_state, 0);
+
+            if (zdo.GetInt(HingesConfigPlugin.LinkKey, 0) == 1)
+            {
+                Door partner = DoorActions.FindPartner(__instance);
+                if (partner != null) DoorActions.SetState(partner, 0, HingesConfigPlugin.MuteLinkedDoorSound.Value);
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(Door), nameof(Door.GetHoverText))]
+    internal static class Door_HoverText_Patch
+    {
+        // The hover text is requested every frame while looking at a door, so the built and
+        // localized extra lines are cached and only rebuilt when something they show changes.
+        private static Door cachedDoor;
+        private static int cLock, cLink, cRemaining, cTotal;
+        private static bool cPartner, cGamepad, cSwap;
+        private static string cLabel, cText;
+        private static float cTime;
+
+        private static void Postfix(Door __instance, ref string __result)
+        {
+            DoorInput.SetHovered(__instance);
+            if (HingesConfigPlugin.HideConfigGui.Value) return;
+
+            ZNetView nview = DoorUtil.GetView(__instance);
+            if (!DoorUtil.IsValid(nview)) return;
+            ZDO zdo = nview.GetZDO();
+
+            int lockDir = zdo.GetInt(HingesConfigPlugin.LockKey, 0);
+            int link = zdo.GetInt(HingesConfigPlugin.LinkKey, 0);
+            bool partner = DoorActions.FindPartner(__instance) != null;
+            bool gamepad = ZInput.IsGamepadActive();
+            string label = gamepad ? HingesConfigPlugin.GamepadModifierLabel.Value : "Shift";
+            bool swap = HingesConfigPlugin.SwapLeftRight.Value;
+            float totalSeconds = HingesConfigPlugin.HideGuiHoldSeconds.Value;
+            int total = Mathf.RoundToInt(totalSeconds);
+            int remaining = DoorInput.HideHeld > 0.5f ? Mathf.CeilToInt(totalSeconds - DoorInput.HideHeld) : 0;
+
+            // Also refreshed every couple of seconds so key rebinding shows up eventually.
+            if (cText == null || cachedDoor != __instance || cLock != lockDir || cLink != link
+                || cPartner != partner || cGamepad != gamepad || cSwap != swap
+                || cRemaining != remaining || cTotal != total || cLabel != label
+                || Time.unscaledTime - cTime > 2f)
+            {
+                cachedDoor = __instance;
+                cLock = lockDir;
+                cLink = link;
+                cPartner = partner;
+                cGamepad = gamepad;
+                cSwap = swap;
+                cRemaining = remaining;
+                cTotal = total;
+                cLabel = label;
+                cTime = Time.unscaledTime;
+                cText = Build(label, lockDir, link, partner, remaining, total);
+            }
+
+            // Door.GetHoverText() returns already-localized text, so the extra lines are localized in Build.
+            __result += cText;
+        }
+
+        private static string Build(string modifier, int lockDir, int link, bool partner, int remaining, int total)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append($"\n[<color=yellow><b>{modifier} + $KEY_Use</b></color>] Swing: {DoorActions.SwingLabel(lockDir)}");
+
+            if (partner)
+            {
+                string linkText = link == 1 ? "linked" : "separate";
+                sb.Append($"\n[<color=yellow><b>{modifier} + hold $KEY_Use</b></color>] Double door: {linkText}");
+            }
+
+            if (remaining > 0)
+                sb.Append($"\n<color=yellow>Hiding this prompt in {remaining}s...</color>");
+            else
+                sb.Append($"\n[<color=yellow><b>hold $KEY_Use</b></color>] {total}s: hide this prompt");
+
+            return Localization.instance.Localize(sb.ToString());
+        }
+    }
+}
